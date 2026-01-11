@@ -1,0 +1,599 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { Lucide, Rocket, Users, Play, Trophy, Zap, Home, ChevronRight, Share2, AlertCircle, CheckCircle2 } from 'lucide-react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, doc, setDoc, onSnapshot, updateDoc, collection, query, getDoc } from 'firebase/firestore';
+
+// --- Configuration & Initialization ---
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'neon-pulse-math-v2';
+
+const TABLES = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+
+const App = () => {
+  const [user, setUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [screen, setScreen] = useState('welcome'); // welcome, solo-config, lobby, game, results
+  const [playerName, setPlayerName] = useState('');
+  const [roomId, setRoomId] = useState('');
+  const [roomData, setRoomData] = useState(null);
+  const [gameMode, setGameMode] = useState('solo'); // solo, battle
+  const [selectedTables, setSelectedTables] = useState([2, 3, 4, 5]);
+  
+  // Game State
+  const [currentProblem, setCurrentProblem] = useState(null);
+  const [options, setOptions] = useState([]);
+  const [score, setScore] = useState(0);
+  const [streak, setStreak] = useState(0);
+  const [timeLeft, setTimeLeft] = useState(60);
+  const [isGameOver, setIsGameOver] = useState(false);
+  const [feedback, setFeedback] = useState(null); // { type: 'correct' | 'wrong', val: string }
+
+  // --- Auth Effect (Rule 3) ---
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) {
+        console.error("Auth failed", err);
+      } finally {
+        setAuthLoading(false);
+      }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // --- Multiplayer Logic (Rule 1 & 3) ---
+  useEffect(() => {
+    // גארד: לא מבצעים האזנה ללא משתמש או חדר
+    if (!user || !roomId || screen === 'welcome') return;
+
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId);
+    const unsubscribe = onSnapshot(roomRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        setRoomData(data);
+        
+        // מעבר אוטומטי למשחק כשהמארחת מתחילה
+        if (data.status === 'playing' && screen === 'lobby') {
+          startGame(data.tables);
+        }
+      }
+    }, (err) => {
+      // טיפול שקט בשגיאות הרשאה בזמן שהחדר נוצר
+      if (err.code !== 'permission-denied') {
+        console.error("Room listener error", err);
+      }
+    });
+
+    return () => unsubscribe();
+  }, [roomId, user, screen]);
+
+  // --- Game Mechanics ---
+  const generateProblem = (tables = selectedTables) => {
+    const t1 = tables[Math.floor(Math.random() * tables.length)];
+    const t2 = Math.floor(Math.random() * 11) + 2;
+    const ans = t1 * t2;
+    
+    let opts = new Set([ans]);
+    while (opts.size < 4) {
+      const wrong = (t1 + (Math.random() > 0.5 ? 1 : -1)) * (t2 + Math.floor(Math.random() * 3) - 1);
+      if (wrong > 0 && wrong !== ans) opts.add(wrong);
+      else opts.add(Math.floor(Math.random() * 100) + 1);
+    }
+    
+    setCurrentProblem({ t1, t2, ans });
+    setOptions(Array.from(opts).sort(() => Math.random() - 0.5));
+  };
+
+  const startGame = (tables) => {
+    setScore(0);
+    setStreak(0);
+    setTimeLeft(60);
+    setIsGameOver(false);
+    setScreen('game');
+    generateProblem(tables || selectedTables);
+  };
+
+  useEffect(() => {
+    if (screen === 'game' && timeLeft > 0 && !isGameOver) {
+      const timer = setTimeout(() => setTimeLeft(prev => prev - 1), 1000);
+      return () => clearTimeout(timer);
+    } else if (timeLeft === 0 && !isGameOver && screen === 'game') {
+      endGame();
+    }
+  }, [timeLeft, screen, isGameOver]);
+
+  const handleAnswer = async (val) => {
+    if (!currentProblem) return;
+
+    if (val === currentProblem.ans) {
+      const newScore = score + (10 * (streak + 1));
+      const newStreak = streak + 1;
+      setScore(newScore);
+      setStreak(newStreak);
+      setFeedback({ type: 'correct', val: 'מעולה!' });
+      
+      if (gameMode === 'battle' && roomId && user) {
+        const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId);
+        try {
+          await updateDoc(roomRef, {
+            [`players.${user.uid}.score`]: newScore,
+            [`players.${user.uid}.streak`]: newStreak
+          });
+        } catch (e) { console.error("Update score failed", e); }
+      }
+    } else {
+      setStreak(0);
+      setFeedback({ type: 'wrong', val: `טעות.. זה ${currentProblem.ans}` });
+    }
+
+    setTimeout(() => {
+      setFeedback(null);
+      generateProblem();
+    }, 600);
+  };
+
+  const endGame = async () => {
+    setIsGameOver(true);
+    setScreen('results');
+    if (gameMode === 'battle' && roomId && user) {
+      const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId);
+      try {
+        await updateDoc(roomRef, {
+          [`players.${user.uid}.finished`]: true
+        });
+      } catch (e) { console.error("End game status failed", e); }
+    }
+  };
+
+  // --- UI Actions ---
+  const createRoom = async () => {
+    if (!playerName || !user) return;
+    const newRoomId = Math.random().toString(36).substring(2, 7).toUpperCase();
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', newRoomId);
+    
+    const initialData = {
+      id: newRoomId,
+      host: user.uid,
+      status: 'waiting',
+      tables: selectedTables,
+      players: {
+        [user.uid]: { name: playerName, score: 0, streak: 0, finished: false }
+      },
+      createdAt: Date.now()
+    };
+    
+    try {
+      await setDoc(roomRef, initialData);
+      setRoomId(newRoomId);
+      setGameMode('battle');
+      setScreen('lobby');
+    } catch (e) {
+      console.error("Create room failed", e);
+    }
+  };
+
+  const joinRoom = async () => {
+    if (!playerName || !roomId || !user) return;
+    const rid = roomId.toUpperCase();
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', rid);
+    
+    try {
+      const snap = await getDoc(roomRef);
+      if (snap.exists()) {
+        await updateDoc(roomRef, {
+          [`players.${user.uid}`]: { name: playerName, score: 0, streak: 0, finished: false }
+        });
+        setRoomId(rid);
+        setGameMode('battle');
+        setScreen('lobby');
+      } else {
+        alert("החדר לא נמצא");
+      }
+    } catch (e) {
+      console.error("Join room failed", e);
+    }
+  };
+
+  const startBattle = async () => {
+    if (!roomId || !user) return;
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId);
+    await updateDoc(roomRef, { status: 'playing' });
+  };
+
+  const toggleTable = (num) => {
+    setSelectedTables(prev => 
+      prev.includes(num) ? prev.filter(n => n !== num) : [...prev, num]
+    );
+  };
+
+  // --- Render Helpers ---
+  const Footer = () => (
+    <div className="mt-auto py-4 text-center text-gray-400 text-xs border-t border-gray-800 w-full shrink-0">
+      כל הזכויות שמורות לחן אביצור
+    </div>
+  );
+
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center">
+        <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-cyan-500"></div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-white font-sans flex flex-col items-center overflow-x-hidden dir-rtl" dir="rtl">
+      
+      {/* Header */}
+      <div className="w-full p-6 flex justify-between items-center bg-slate-900/50 backdrop-blur-md border-b border-cyan-500/30 sticky top-0 z-50">
+        <div className="flex items-center gap-2">
+          <Zap className="text-cyan-400 fill-cyan-400" size={28} />
+          <h1 className="text-2xl font-black tracking-tighter bg-gradient-to-r from-cyan-400 to-fuchsia-500 bg-clip-text text-transparent">
+            NEON PULSE
+          </h1>
+        </div>
+        {screen !== 'welcome' && (
+          <button onClick={() => setScreen('welcome')} className="p-2 hover:bg-white/10 rounded-full transition">
+            <Home size={24} />
+          </button>
+        )}
+      </div>
+
+      <main className="flex-1 w-full max-w-2xl p-6 flex flex-col items-center justify-center relative">
+        
+        {/* Background blobs */}
+        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[500px] h-[500px] bg-cyan-500/10 rounded-full blur-[120px] -z-10" />
+        <div className="absolute top-1/3 right-0 w-[300px] h-[300px] bg-fuchsia-500/10 rounded-full blur-[100px] -z-10" />
+
+        {/* Welcome Screen */}
+        {screen === 'welcome' && (
+          <div className="text-center space-y-8 animate-in fade-in zoom-in duration-500 w-full">
+            <div className="space-y-2">
+              <h2 className="text-4xl font-bold">מוכנה למרוץ?</h2>
+              <p className="text-gray-400 text-lg">תרגול כפולות בחוויה שעוד לא הכרת</p>
+            </div>
+            
+            <div className="bg-slate-900/80 p-6 rounded-2xl border border-white/10 shadow-2xl space-y-4">
+              <input 
+                type="text" 
+                placeholder="הכניסי את שמך..."
+                className="w-full bg-slate-800 border-2 border-slate-700 rounded-xl px-4 py-3 text-lg focus:border-cyan-500 outline-none transition text-center"
+                value={playerName}
+                onChange={(e) => setPlayerName(e.target.value)}
+              />
+              
+              <div className="grid grid-cols-2 gap-4">
+                <button 
+                  onClick={() => { setGameMode('solo'); setScreen('solo-config'); }}
+                  className="flex flex-col items-center gap-2 p-4 bg-slate-800 hover:bg-slate-700 rounded-xl border border-white/5 transition group"
+                >
+                  <Rocket className="text-cyan-400 group-hover:scale-110 transition" size={32} />
+                  <span className="font-bold">משחק יחיד</span>
+                </button>
+                <button 
+                  onClick={() => setScreen('multi-choice')}
+                  className="flex flex-col items-center gap-2 p-4 bg-slate-800 hover:bg-slate-700 rounded-xl border border-white/5 transition group"
+                >
+                  <Users className="text-fuchsia-400 group-hover:scale-110 transition" size={32} />
+                  <span className="font-bold">תחרות חברות</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Multi Choice Screen */}
+        {screen === 'multi-choice' && (
+          <div className="w-full space-y-6 animate-in slide-in-from-bottom-4 duration-300">
+             <div className="bg-slate-900/80 p-6 rounded-2xl border border-white/10 shadow-2xl space-y-6">
+                <div className="space-y-4">
+                  <h3 className="text-xl font-bold">הצטרפות לחדר</h3>
+                  <div className="flex gap-2">
+                    <input 
+                      type="text" 
+                      placeholder="קוד חדר"
+                      className="flex-1 bg-slate-800 border border-slate-700 rounded-xl px-4 py-2 uppercase text-center font-bold tracking-widest"
+                      value={roomId}
+                      onChange={(e) => setRoomId(e.target.value)}
+                    />
+                    <button onClick={joinRoom} className="bg-fuchsia-600 hover:bg-fuchsia-500 px-6 py-2 rounded-xl font-bold transition">הצטרפי</button>
+                  </div>
+                </div>
+                
+                <div className="relative py-2">
+                  <div className="absolute inset-0 flex items-center"><span className="w-full border-t border-white/10"></span></div>
+                  <div className="relative flex justify-center text-xs uppercase"><span className="bg-slate-900 px-4 text-gray-500 font-bold">או</span></div>
+                </div>
+
+                <div className="space-y-4">
+                  <h3 className="text-xl font-bold">יצירת חדר</h3>
+                  <button onClick={createRoom} className="w-full bg-cyan-600 hover:bg-cyan-500 py-4 rounded-xl font-bold text-lg transition flex items-center justify-center gap-2">
+                    <Zap size={20} className="fill-white" />
+                    צרי חדר חדש לתחרות
+                  </button>
+                </div>
+             </div>
+             <button onClick={() => setScreen('welcome')} className="text-gray-400 hover:text-white transition w-full text-center">חזרה</button>
+          </div>
+        )}
+
+        {/* Solo Config */}
+        {screen === 'solo-config' && (
+          <div className="w-full space-y-8 animate-in fade-in duration-300">
+            <div className="text-center">
+              <h2 className="text-3xl font-bold">בחרי כפולות לאימון</h2>
+              <p className="text-gray-400">אילו לוחות כפל תרצי לתרגל הפעם?</p>
+            </div>
+            
+            <div className="grid grid-cols-4 gap-3">
+              {TABLES.map(num => (
+                <button 
+                  key={num}
+                  onClick={() => toggleTable(num)}
+                  className={`py-3 rounded-xl font-bold text-xl transition-all border-2 ${
+                    selectedTables.includes(num) 
+                    ? 'bg-cyan-500 border-cyan-400 shadow-[0_0_15px_rgba(34,211,238,0.4)]' 
+                    : 'bg-slate-800 border-slate-700 text-gray-500'
+                  }`}
+                >
+                  {num}
+                </button>
+              ))}
+            </div>
+
+            <button 
+              onClick={() => startGame()}
+              disabled={selectedTables.length === 0}
+              className="w-full py-5 bg-gradient-to-r from-cyan-500 to-blue-600 rounded-2xl font-black text-2xl shadow-xl hover:scale-[1.02] active:scale-95 transition disabled:opacity-50"
+            >
+              מתחילים!
+            </button>
+          </div>
+        )}
+
+        {/* Lobby */}
+        {screen === 'lobby' && roomData && (
+          <div className="w-full space-y-6 animate-in fade-in">
+            <div className="bg-slate-900/80 p-6 rounded-2xl border border-cyan-500/50 text-center relative overflow-hidden">
+              <div className="absolute top-0 left-0 w-full h-1 bg-cyan-500 animate-pulse"></div>
+              <span className="text-gray-400 text-sm uppercase tracking-widest font-bold">קוד החדר</span>
+              <h2 className="text-5xl font-black text-cyan-400 mt-1 tracking-widest">{roomId}</h2>
+              <p className="text-gray-400 mt-4 text-sm">הזמיני חברות להצטרף עם הקוד הזה</p>
+            </div>
+
+            <div className="bg-slate-900/80 rounded-2xl border border-white/10 overflow-hidden">
+              <div className="bg-white/5 px-4 py-3 border-b border-white/10 flex justify-between items-center">
+                <span className="font-bold flex items-center gap-2">
+                   <Users size={18} className="text-cyan-400" />
+                   משתתפות ({Object.keys(roomData.players || {}).length})
+                </span>
+              </div>
+              <div className="p-4 space-y-2 max-h-60 overflow-y-auto">
+                {roomData.players && Object.values(roomData.players).map((p, i) => (
+                  <div key={i} className="flex items-center gap-3 p-3 bg-white/5 rounded-xl border border-white/5">
+                    <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-fuchsia-500 to-cyan-500 flex items-center justify-center font-bold text-sm">
+                      {p.name ? p.name[0] : '?'}
+                    </div>
+                    <span className="flex-1 font-medium">{p.name}</span>
+                    <div className="flex items-center gap-1 text-xs text-green-400">
+                      <CheckCircle2 size={14} />
+                      מוכנה
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {roomData.host === user?.uid ? (
+              <button 
+                onClick={startBattle}
+                className="w-full py-4 bg-gradient-to-r from-fuchsia-600 to-pink-600 hover:from-fuchsia-500 hover:to-pink-500 rounded-xl font-bold text-xl shadow-lg transition transform hover:scale-[1.02]"
+              >
+                שגרי את המרוץ לכולן!
+              </button>
+            ) : (
+              <div className="text-center p-6 bg-slate-900/50 rounded-xl border border-dashed border-white/10">
+                <p className="text-fuchsia-400 animate-pulse font-bold text-lg">המארחת תתחיל את המרוץ בקרוב...</p>
+                <p className="text-xs text-gray-500 mt-2">הכיני את האצבעות!</p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Game Screen */}
+        {screen === 'game' && currentProblem && (
+          <div className="w-full flex flex-col items-center gap-8 animate-in zoom-in duration-300">
+            
+            {/* HUD */}
+            <div className="w-full flex justify-between items-center px-2 bg-slate-900/40 p-4 rounded-3xl border border-white/5 shadow-inner">
+              <div className="flex flex-col items-center min-w-[60px]">
+                <span className="text-[10px] text-cyan-400 font-bold uppercase tracking-wider">ניקוד</span>
+                <span className="text-3xl font-black">{score}</span>
+              </div>
+              
+              <div className="relative flex flex-col items-center">
+                <div className={`w-20 h-20 rounded-full border-[6px] flex items-center justify-center transition-all duration-300 ${timeLeft < 10 ? 'border-red-500 text-red-500 scale-110' : 'border-cyan-500/50 text-white'}`}>
+                  <span className="text-4xl font-black">{timeLeft}</span>
+                </div>
+              </div>
+
+              <div className="flex flex-col items-center min-w-[60px]">
+                <span className="text-[10px] text-fuchsia-400 font-bold uppercase tracking-wider">רצף</span>
+                <div className="flex items-center gap-1">
+                  <span className="text-3xl font-black">{streak}</span>
+                  <Zap size={20} className={streak > 0 ? "fill-fuchsia-500 text-fuchsia-500 animate-pulse" : "text-gray-700"} />
+                </div>
+              </div>
+            </div>
+
+            {/* Problem Area */}
+            <div className="relative group w-full flex justify-center">
+              <div className="absolute inset-0 bg-cyan-500/20 blur-[80px] rounded-full scale-110 opacity-50" />
+              <div className="relative bg-slate-900/95 border-2 border-white/10 rounded-[48px] px-16 py-12 shadow-2xl flex flex-col items-center gap-2 w-full max-w-sm overflow-hidden">
+                 <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-cyan-400 to-transparent opacity-50"></div>
+                 <span className="text-gray-400 font-bold text-sm tracking-widest mb-2 uppercase">פִּתְרִי בִּמְהִירוּת</span>
+                 <div className="text-8xl font-black tracking-tighter flex items-center gap-4">
+                    <span>{currentProblem.t1}</span>
+                    <span className="text-cyan-400 text-6xl">×</span>
+                    <span>{currentProblem.t2}</span>
+                 </div>
+              </div>
+            </div>
+
+            {/* Answers Grid */}
+            <div className="grid grid-cols-2 gap-4 w-full">
+              {options.map((opt, idx) => (
+                <button
+                  key={idx}
+                  onClick={() => handleAnswer(opt)}
+                  className="group relative overflow-hidden bg-slate-900 border-2 border-white/5 hover:border-cyan-400/50 rounded-[28px] py-8 text-4xl font-black transition-all hover:scale-[1.03] active:scale-95 shadow-lg"
+                >
+                  <div className="absolute inset-0 bg-gradient-to-br from-white/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
+                  {opt}
+                </button>
+              ))}
+            </div>
+
+            {/* Battle Feed */}
+            {gameMode === 'battle' && roomData && (
+              <div className="w-full bg-slate-900/60 p-5 rounded-[32px] border border-white/5 space-y-4 shadow-xl">
+                <div className="flex justify-between items-center px-1">
+                   <p className="text-xs text-gray-500 font-bold uppercase tracking-widest">מצב המרוץ</p>
+                   <div className="flex items-center gap-1 text-[10px] text-fuchsia-400 font-bold bg-fuchsia-500/10 px-2 py-1 rounded-full">
+                      <Users size={10} />
+                      {Object.keys(roomData.players || {}).length} מחוברות
+                   </div>
+                </div>
+                <div className="space-y-3">
+                  {Object.entries(roomData.players || {}).sort((a,b) => b[1].score - a[1].score).map(([uid, p], i) => (
+                    <div key={uid} className="space-y-1.5">
+                      <div className="flex justify-between text-xs font-bold px-1">
+                        <span className={uid === user?.uid ? 'text-cyan-400' : 'text-gray-300'}>{p.name} {uid === user?.uid && '(את)'}</span>
+                        <span className="text-white/80">{p.score} <span className="text-[10px] text-gray-500">נק'</span></span>
+                      </div>
+                      <div className="h-2.5 bg-black/40 rounded-full overflow-hidden p-[2px]">
+                        <div 
+                          className={`h-full transition-all duration-700 rounded-full ${uid === user?.uid ? 'bg-gradient-to-r from-cyan-600 to-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.5)]' : 'bg-slate-700'}`} 
+                          style={{ width: `${Math.min(100, (p.score / 2000) * 100)}%` }}
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Results Screen */}
+        {screen === 'results' && (
+          <div className="w-full space-y-8 animate-in zoom-in duration-500 text-center py-4">
+            <div className="relative inline-block">
+               <Trophy className="mx-auto text-yellow-400 drop-shadow-[0_0_20px_rgba(250,204,21,0.4)]" size={100} />
+               <div className="absolute -top-2 -right-2 bg-fuchsia-600 text-[10px] font-bold px-2 py-1 rounded-full animate-bounce">WOW!</div>
+            </div>
+            <h2 className="text-5xl font-black tracking-tight">המרוץ הסתיים!</h2>
+            
+            <div className="bg-slate-900/90 p-10 rounded-[40px] border border-white/10 shadow-2xl inline-block min-w-[320px] relative overflow-hidden">
+              <div className="absolute top-0 left-0 w-full h-1.5 bg-gradient-to-r from-cyan-500 via-fuchsia-500 to-cyan-500"></div>
+              <div className="flex flex-col gap-1 mb-8">
+                <span className="text-gray-500 uppercase font-black tracking-[0.2em] text-xs">הניקוד שלך</span>
+                <span className="text-8xl font-black text-white tabular-nums drop-shadow-lg">
+                  {score}
+                </span>
+              </div>
+              
+              <div className="grid grid-cols-2 gap-4">
+                <div className="p-5 bg-white/5 rounded-3xl border border-white/5">
+                  <div className="text-fuchsia-400 font-black text-3xl">{streak}</div>
+                  <div className="text-[10px] text-gray-400 uppercase font-bold tracking-widest mt-1">שיא רצף</div>
+                </div>
+                <div className="p-5 bg-white/5 rounded-3xl border border-white/5">
+                  <div className="text-cyan-400 font-black text-3xl">{Math.floor(score/10)}</div>
+                  <div className="text-[10px] text-gray-400 uppercase font-bold tracking-widest mt-1">דיוק</div>
+                </div>
+              </div>
+            </div>
+
+            {gameMode === 'battle' && roomData && (
+              <div className="w-full bg-slate-900/80 rounded-[32px] border border-fuchsia-500/20 overflow-hidden shadow-2xl">
+                <div className="bg-fuchsia-600/20 py-3 font-black text-sm uppercase tracking-widest flex items-center justify-center gap-2">
+                   <Trophy size={16} className="text-fuchsia-400" />
+                   טבלת המנצחות
+                </div>
+                <div className="p-6 space-y-3">
+                  {Object.values(roomData.players || {})
+                    .sort((a, b) => b.score - a.score)
+                    .map((p, i) => (
+                      <div key={i} className={`flex items-center gap-4 p-3 rounded-2xl ${i === 0 ? 'bg-yellow-400/10 border border-yellow-400/20' : 'bg-white/5 border border-transparent'}`}>
+                        <span className={`font-black text-xl w-6 ${i === 0 ? 'text-yellow-400' : 'text-gray-500'}`}>{i+1}.</span>
+                        <span className="flex-1 text-right font-bold text-lg">{p.name}</span>
+                        <span className="font-black text-2xl text-cyan-400 tabular-nums">{p.score}</span>
+                      </div>
+                    ))}
+                </div>
+              </div>
+            )}
+
+            <div className="flex flex-col sm:flex-row gap-4 pt-4">
+              <button 
+                onClick={() => setScreen('welcome')}
+                className="flex-1 py-5 bg-slate-800 hover:bg-slate-700 rounded-2xl font-black text-lg transition-all border border-white/5"
+              >
+                לתפריט הראשי
+              </button>
+              <button 
+                onClick={() => startGame()}
+                className="flex-1 py-5 bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 rounded-2xl font-black text-xl shadow-xl transition-all transform hover:scale-[1.02]"
+              >
+                שחקי שוב!
+              </button>
+            </div>
+          </div>
+        )}
+
+      </main>
+
+      <Footer />
+
+      {/* Floating feedback animation portal */}
+      {feedback && (
+        <div className={`fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none z-[100] animate-in zoom-in duration-200`}>
+           <div className={`text-6xl font-black px-12 py-6 rounded-[40px] shadow-[0_0_50px_rgba(0,0,0,0.5)] border-4 ${
+                feedback.type === 'correct' ? 'bg-green-500 border-green-400 text-white' : 'bg-red-500 border-red-400 text-white'
+              }`}>
+              {feedback.val}
+           </div>
+        </div>
+      )}
+
+      {/* Styles for animation */}
+      <style dangerouslySetInnerHTML={{ __html: `
+        @keyframes pulse-cyan {
+          0%, 100% { opacity: 0.5; transform: scale(1.1); }
+          50% { opacity: 0.7; transform: scale(1.15); }
+        }
+        .dir-rtl { direction: rtl; }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 10px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+      `}} />
+    </div>
+  );
+};
+
+export default App;
